@@ -48,28 +48,32 @@ Python Connector 统一维护启动互斥、运行记录和本机 Connector ID �
 
 `instanceId` 用于防止过期实例清除另一个实例的记录。旧的 `AA_CONNECTOR_OWNER_INSTANCE` / `AA_CONNECTOR_OWNER_PID` 不再用于授权或委托占用。
 
-## RPC 冲突与入口处理
+## 控制通道
 
-`anywhere-cli rpc` 先建立控制通道。`connector.acquireOwnership` 用于无配置时的启动预检；`connector.saveConfig`、配对和启动也由 Python 检查占用。Host 不自行检查 PID 或写入运行记录。
+`anywhere-cli rpc` 启动时拉起本进程专属的 MeshCall `LocalRouter`（Unix socket / Windows 命名管道），注册 `aa.local.v2.Control` 与 `aa.local.v2.Logs`，并在 stdout 写一行就绪信息后不再写任何内容：
+
+```json
+{"kind":"connector.ready","version":1,"instanceId":"4f1a…","pid":12345,
+ "endpoint":{"unixPath":"…/router/4f1a….sock"},"key":"mk_host_…"}
+```
+
+宿主（Desktop 或插件管理器）用该 endpoint 与 key 建立 `Mesh`，调用控制方法；stdin 关闭即退出（Router 随之退出）。日志通过 `aa.local.v2.Logs.tail(since)` 订阅，状态与配对通过 `aa.local.v2.Control.events(since)` 订阅；两条流都由客户端保存 `lastSeq` 并在断线后带退避重新订阅。方法名、参数与旧 JSON-RPC 一一对应（`getState`、`getPaths`、`acquireOwnership`、`getConfig`、`saveConfig`、`start`、`stop`、`restart`、`startPairing`、`cancelPairing`）。
+
+## 启动互斥冲突
+
+`acquireOwnership` 用于无配置时的启动预检；`saveConfig`、配对和启动也由 Python 检查占用。Host 不自行检查 PID 或写入运行记录。冲突是应用错误码 `connector_already_running`：
 
 ```json
 {
-  "jsonrpc": "2.0",
-  "id": 1,
-  "error": {
-    "code": -32009,
-    "message": "Another Connector is running (cli, PID 12345). Stop that Connector process, then retry.",
-    "data": {
-      "reason": "connector_already_running",
-      "owner": {"kind": "cli", "pid": 12345}
-    }
-  }
+  "code": "connector_already_running",
+  "message": "Another Connector is running (cli, PID 12345). Stop that Connector process, then retry.",
+  "details": {"reason": "connector_already_running", "owner": {"kind": "cli", "pid": 12345}}
 }
 ```
 
-冲突是请求错误，RPC 通道仍可响应 `connector.getState`，并在占用方退出后接受重试。直接 CLI 启动则打印错误并以退出码 `2` 退出。
+冲突是调用错误，控制通道仍可响应 `getState`，并在占用方退出后接受重试。其他意外失败映射为应用错误码 `connector_error`（等价于旧 `-32000`），参数错误为 `invalid_argument`。直接 CLI 启动则打印错误并以退出码 `2` 退出。
 
-- Desktop 根据 RPC 错误展示冲突状态和重试入口，停止自动重启循环；重试再次调用 Python。Desktop 自身不持有或释放启动互斥。
+- Desktop 根据错误码展示冲突状态和重试入口，停止自动重启循环；重试再次调用 Python。Desktop 自身不持有或释放启动互斥。
 - 插件把错误转为引导流程中的可重试提示，关闭自己启动但被拒绝的子进程。私有绑定和凭据保留，下次重试不因此新建设备。
 - 提示要求结束占用方的 Connector 进程。仅断开服务器连接不代表进程退出。
 
