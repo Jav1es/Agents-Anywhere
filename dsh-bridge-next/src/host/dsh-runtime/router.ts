@@ -17,6 +17,17 @@ import type { TimelineItem } from './types.js'
 export interface SessionReader {
   native?: NativeRuntime
   query: Pick<SessionQueryEngine, 'listSessions' | 'readSession' | 'readTitleSnapshots'>
+  /**
+   * Timestamp of a session's most recent event, in epoch milliseconds.
+   *
+   * The sidebar sorts by last activity, not by creation time, so a session that
+   * was created days ago but used a minute ago must not sink to the bottom of
+   * the list. `header.createdAt` cannot express that; this can.
+   *
+   * Optional: a reader that cannot observe event times falls back to
+   * `header.createdAt`, which is the pre-existing behaviour.
+   */
+  lastActivityAt?(id: SessionId): Promise<number | undefined>
   status(id: SessionId): 'idle' | 'running' | undefined
 }
 interface Page<T> { id: string, values: T[], expires: number }
@@ -249,12 +260,30 @@ export class RuntimeRouter {
     }
     const titles = await this.reader.query.readTitleSnapshots(records.map(item => item.header.id), signal)
     const titleById = new Map(titles.map(title => [title.sessionId, title]))
+    // Sort by last activity, matching the DSH sidebar (which orders by
+    // `max(updatedAt, lastPromptAt)`) instead of by creation time. Resolved in
+    // parallel so a full page costs one round of reads, not a serial chain.
+    const lastActivityById = new Map<string, number>()
+    if (this.reader.lastActivityAt !== undefined) {
+      const readings = await Promise.all(records.map(async item => {
+        try {
+          return [item.header.id, await this.reader.lastActivityAt!(item.header.id)] as const
+        } catch {
+          return [item.header.id, undefined] as const
+        }
+      }))
+      for (const [id, at] of readings) {
+        if (at !== undefined && Number.isFinite(at)) lastActivityById.set(id, at)
+      }
+    }
     const sessions = records.map(item => {
       const title = titleById.get(item.header.id)
+      const lastActivityAt = lastActivityById.get(item.header.id)
       return {
         runtime: 'dsh', sessionId: sessionId(this.namespace, item.header.id), externalSessionId: item.header.id,
         title: title?.status === 'fulfilled' ? title.value.title?.title ?? null : null,
-        cwd: item.header.cwd ?? null, orderingTime: new Date(item.header.createdAt).toISOString(),
+        cwd: item.header.cwd ?? null,
+        orderingTime: new Date(lastActivityAt ?? item.header.createdAt).toISOString(),
         metadata: {
           live: item.live, persisted: item.persisted, parentSession: item.header.parentSession ?? null,
           origin: item.header.origin ?? null, readOnly: !this.reader.native?.ctx.get('agents'),

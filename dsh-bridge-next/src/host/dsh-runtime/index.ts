@@ -4,6 +4,7 @@ import { foldSessionTitle } from '@deepseek-ai/dsh-session-title'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-session-query'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import { join } from 'node:path'
 import { bridgeDirectory, Config, legacyBridgeDirectory } from '../config.js'
 import { BridgeConnection } from './connection.js'
@@ -54,6 +55,12 @@ export class DshRuntimeService extends Service {
           }
           signal?.throwIfAborted()
           return results
+        },
+        // Mirrors the timestamp `sync.ts` already reports as `lastActivityAt`, so
+        // the list orders by last activity the same way the session.meta upserts do.
+        lastActivityAt: async (id: SessionId) => {
+          const log = await this.native.source.readLog(id)
+          return log.events.at(-1)?.time ?? log.session.createdAt
         } },
       status: id => this.native.status(id),
     }, this.diagnostics, 1000, this.logOutput)
