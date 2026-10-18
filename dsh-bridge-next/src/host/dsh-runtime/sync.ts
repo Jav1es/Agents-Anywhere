@@ -219,6 +219,8 @@ export class SyncFeed {
     if (!await this.native.visible(id)) return
     this.native.diagnostics.log('debug', 'snapshot.started', { streamId: this.id, sessionId: id })
     const snapshotItems = contentItems(projection.snapshot())
+    // The capture replaces the timeline: earlier notifications must land first.
+    if (this.bufferedOperations?.length) await this.flushOperations()
     // A capture id keeps a cancelled stream's pages from landing in the next capture.
     const captureId = randomUUID()
     const result = await this.delivery(() => this.transport.ingestSnapshot({ captureId, subscriptionId: this.id, sessionId: platformId,
@@ -272,6 +274,8 @@ export class SyncFeed {
     for (const id of this.native.candidates()) if (!this.published.has(id)) await this.baseline(id)
   }
   private async unavailable(id: string): Promise<void> {
+    // A capture or checkpoint deletion overtakes buffered notifications otherwise.
+    if (this.bufferedOperations?.length) await this.flushOperations()
     const source = await this.sourceState(id)
     // Preserve AA history; a failed read never publishes an empty snapshot.
     // Only feeds that imported this session may create live source updates.

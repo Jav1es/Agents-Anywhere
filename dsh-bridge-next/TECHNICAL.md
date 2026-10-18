@@ -6,7 +6,7 @@ Agents Anywhere 的 DSH 插件。支持没有安装 AA Desktop 时的账号登�
 
 职责与后续开发见 [开发计划](./DEVELOPMENT_PLAN.md)，完整产品设计见 [Onboarding 业务方案](./ONBOARDING_PLAN.md)，检查命令与手动验收见 [验证记录](./VERIFICATION.md)。
 
-历史同步的慢速上传通过协商 `uploadProgressVersion:1` 延长 ACK 的无进展等待窗口。进度只表示 HTTP 传输继续推进；云端确认成功后才能 ACK 和保存检查点。完整快照仍一次提交，详细约束见[本机契约](../contracts/dsh-bridge/1.0/README.md#slow-uploads-negotiated-upload-progress-v1)和[慢速上传说明](../docs/dsh-slow-upload.md)。
+同步批通过 `aa.dsh.v2.Sync.ingestBatch` 交回 Connector，完整快照通过 `aa.dsh.v2.Sync.ingestSnapshot` 客户端流提交；调用返回即表示已 ingest（或被永久拒绝），检查点只能在其后保存。2.2.0 起不再有 `uploadProgressVersion` 与进度续期：`startupTimeoutMs` 只约束初始发现，慢上传就是更慢的调用返回。详细约束见[桥接契约 2.0](../contracts/dsh-bridge/2.0/README.md)和[慢速上传说明](../docs/dsh-slow-upload.md)。
 
 ## 已实现
 
@@ -137,7 +137,7 @@ corepack yarn dev
 
 登录成功后，整个弹窗切换为紧凑的「已登录」面板：账号头像、昵称、邮箱（有设置时）、当前服务器，Connector 运行状态，以及「打开 Web」「退出登录」两个按钮。头像来自账号接口；未设置或图片加载失败时显示 DSH 官方用户图标。旧账号的头像、邮箱会在打开面板时后台补全，读取失败时保留已有资料。
 
-Connector 状态读取其现有 stdio `connector/state` 通知，反映实际运行任务而非仅判断 Python 控制进程存活。凭据失效后，Host 立即查询当前账号下的这个设备：确认已删除时，在 Connector 状态区域显示「本机设备已被删除，是否重新创建？」和「重新创建」按钮；设备仍存在时显示「本机设备已断开连接，是否重新连接？」和「重新连接」按钮。弹窗沿用每 1.5 秒的状态刷新，关闭弹窗不影响 Host 接收通知。
+Connector 状态来自 `aa.local.v2.Control` 的 `events` 流（`kind: "state"`），反映实际运行任务而非仅判断 Python 控制进程存活。凭据失效后，Host 立即查询当前账号下的这个设备：确认已删除时，在 Connector 状态区域显示「本机设备已被删除，是否重新创建？」和「重新创建」按钮；设备仍存在时显示「本机设备已断开连接，是否重新连接？」和「重新连接」按钮。弹窗沿用每 1.5 秒的状态刷新，关闭弹窗不影响 Host 接收通知。
 
 恢复必须由按钮触发：重新连接只给当前 Connector ID 通过现有 `/revoke` 接口签发凭据；重新创建使用新注册键，丢失响应后保留该键以便幂等重试。重启插件也不会自动续签失效凭据或重建已删除设备。网络错误不判断为删除，显示「重新检查」；账号凭据失效则提示重新登录。这里的失效是 Connector 长期凭据被撤销或设备被删除，短期 access token 的正常刷新仍由 Connector 自行处理。
 
@@ -234,8 +234,8 @@ Web 在相关 revision/availability 变化时刷新打开的目录，重开菜�
 错误，不代表副作用回滚。未知名称/输入拒绝没有 executionState。handler 抛异常返回
 `command_failed`；取消、超时或断连后无法确认结果返回 `command_outcome_unknown`。
 这些无法确认的结果均为 `ok:false`、`executionState:'unknown'`、`retryable:false`，
-不猜测 correlation，也不自动重试。显式 Python task cancellation 继续向上传播，并发送
-已有 `$/cancelRequest`。UI 应保留失败草稿，提示刷新会话状态后再决定是否重发。
+不猜测 correlation，也不自动重试。显式 Python task cancellation 继续向上传播，由 MeshCall 的调用取消
+（`call.cancel`）传递到插件。UI 应保留失败草稿，提示刷新会话状态后再决定是否重发。
 
 ## 验证范围
 

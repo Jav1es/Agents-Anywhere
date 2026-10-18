@@ -122,6 +122,10 @@ class SyncService:
         subscriber = self._subscriber(subscription_id)
         return await run_on_loop(self._loop, work(subscriber))
 
+    async def _serialized[T](self, work: Callable[[SyncSubscriber], Awaitable[T]], subscription_id: str) -> T:
+        subscriber = self._subscriber(subscription_id)
+        return await run_on_loop(self._loop, subscriber.serialized(lambda: work(subscriber)))
+
     @mutates(idempotent=True)
     async def ingestBatch(self, batch: SyncBatch) -> IngestResult:
         """Ingest one batch of a subscription; returning is its acknowledgement."""
@@ -131,7 +135,7 @@ class SyncService:
     @query
     async def loadCheckpoint(self, subscriptionId: str, externalSessionId: str) -> CheckpointResult:
         """The checkpoint the Connector stored for one native session."""
-        checkpoint = await self._call(
+        checkpoint = await self._serialized(
             lambda subscriber: subscriber.load_checkpoint(externalSessionId), subscriptionId,
         )
         return CheckpointResult(checkpoint=checkpoint)
@@ -141,7 +145,7 @@ class SyncService:
         self, subscriptionId: str, externalSessionId: str, checkpoint: dict[str, Any],
     ) -> IngestResult:
         """Store a checkpoint; withheld for a quarantined session."""
-        await self._call(
+        await self._serialized(
             lambda subscriber: subscriber.save_checkpoint(externalSessionId, checkpoint), subscriptionId,
         )
         return IngestResult()
@@ -149,7 +153,7 @@ class SyncService:
     @mutates(idempotent=True)
     async def deleteCheckpoint(self, subscriptionId: str, externalSessionId: str) -> IngestResult:
         """Drop a checkpoint; the next baseline is a full capture."""
-        await self._call(
+        await self._serialized(
             lambda subscriber: subscriber.delete_checkpoint(externalSessionId), subscriptionId,
         )
         return IngestResult()
@@ -160,14 +164,21 @@ class SyncService:
     ) -> SnapshotResult:
         """Assemble a paged snapshot; the call returning means it was stored or quarantined."""
         subscriber = self._subscriber(request.subscriptionId)
-        await run_on_loop(self._loop, subscriber.begin_snapshot(request))
+        await self._serialized(lambda _s: _s.begin_snapshot(request), request.subscriptionId)
         try:
             async for page in items:
-                await run_on_loop(self._loop, subscriber.add_snapshot_page(page))
-            return await run_on_loop(self._loop, subscriber.commit_snapshot(request.captureId))
+                await self._serialized(lambda _s, page=page: _s.add_snapshot_page(page), request.subscriptionId)
+            return await self._serialized(
+                lambda _s: _s.commit_snapshot(request.captureId), request.subscriptionId,
+            )
         except BaseException:
+            # The call is cancelled here, so schedule the abort instead of awaiting it.
             with contextlib.suppress(Exception):
-                await run_on_loop(self._loop, subscriber.abort_snapshot(request.captureId))
+                future = asyncio.run_coroutine_threadsafe(
+                    subscriber.serialized(lambda: subscriber.abort_snapshot(request.captureId)),
+                    self._loop,
+                )
+                future.add_done_callback(lambda done: done.exception())
             raise
 
 

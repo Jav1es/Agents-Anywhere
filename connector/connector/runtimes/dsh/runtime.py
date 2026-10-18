@@ -114,6 +114,10 @@ class DshRuntime(AgentRuntime):
             self._restart_task.cancel()
             await asyncio.gather(self._restart_task, return_exceptions=True)
             self._restart_task = None
+        if self._relay_restart_task is not None:
+            self._relay_restart_task.cancel()
+            await asyncio.gather(self._relay_restart_task, return_exceptions=True)
+            self._relay_restart_task = None
         async with self._connect_lock:
             client, self._client = self._client, None
             if client is not None:

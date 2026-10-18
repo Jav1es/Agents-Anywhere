@@ -5,7 +5,7 @@ import pickle
 import sys
 import tempfile
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -463,7 +463,7 @@ class SyncRelay:
 
     async def ingest(self, batch: SyncBatch) -> None:
         """Run one batch; returning is the plugin's acknowledgement."""
-        await asyncio.wait_for(self.confirmed.wait(), SUBSCRIBE_CONFIRM_TIMEOUT_SECONDS)
+        await self._await_subscription()
         task = asyncio.current_task()
         if task is not None:
             self._ingest_tasks.add(task)
@@ -486,12 +486,29 @@ class SyncRelay:
             self.expected_batch += 1
             self.failures = 0
 
+    async def serialized[T](self, operation: Callable[[], Awaitable[T]]) -> T:
+        """Run one snapshot or checkpoint operation with the batches, tracked for close()."""
+        task = asyncio.current_task()
+        if task is not None:
+            self._ingest_tasks.add(task)
+        try:
+            async with self.ingest_lock:
+                return await operation()
+        finally:
+            if task is not None:
+                self._ingest_tasks.discard(task)
+
+    async def _await_subscription(self) -> None:
+        await asyncio.wait_for(self.confirmed.wait(), SUBSCRIBE_CONFIRM_TIMEOUT_SECONDS)
+
     async def load_checkpoint(self, external_session_id: str) -> dict[str, Any] | None:
+        await self._await_subscription()
         if not self.durable_checkpoints:
             return None
         return _checkpoint(await self.host.sync_state_read(f"dsh/sync/checkpoints/{external_session_id}"))
 
     async def save_checkpoint(self, external_session_id: str, checkpoint: dict[str, Any]) -> None:
+        await self._await_subscription()
         if not self.durable_checkpoints:
             return
         value = _checkpoint(checkpoint)
@@ -505,6 +522,7 @@ class SyncRelay:
         await self.host.sync_state_write(f"dsh/sync/checkpoints/{external_session_id}", value)
 
     async def delete_checkpoint(self, external_session_id: str) -> None:
+        await self._await_subscription()
         await self.host.sync_state_delete(f"dsh/sync/checkpoints/{external_session_id}")
 
     async def begin_snapshot(self, request: SnapshotRequest) -> None:

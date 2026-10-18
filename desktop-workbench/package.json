@@ -50,6 +50,7 @@
       "!dist/electron/*.test.js",
       "!dist/electron/backend/*.test.js",
       "!node_modules/agents-anywhere-desktop-renderer/**",
+      "!node_modules/meshcall-router-*/**",
       "renderer/out/**",
       "package.json"
     ],

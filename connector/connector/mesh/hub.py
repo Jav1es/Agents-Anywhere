@@ -246,12 +246,6 @@ class LocalHub:
 
     async def stop(self) -> None:
         self._stopping = True
-        cleanups, self._cleanups = self._cleanups, []
-        for cleanup in reversed(cleanups):
-            try:
-                await cleanup()
-            except Exception:  # noqa: BLE001 - one failed cleanup must not keep the Router alive.
-                logger.exception("local router cleanup failed")
         async with self._lock:
             supervisor, self._supervisor = self._supervisor, None
             if supervisor is not None:
@@ -259,6 +253,14 @@ class LocalHub:
                 with contextlib.suppress(asyncio.CancelledError):
                     await supervisor
             await self._stop_serving()
+            # Stop advertising this Router before it goes away, but only after
+            # the supervisor can no longer restart it.
+            cleanups, self._cleanups = self._cleanups, []
+            for cleanup in reversed(cleanups):
+                try:
+                    await cleanup()
+                except Exception:  # noqa: BLE001 - one failed cleanup must not keep the Router alive.
+                    logger.exception("local router cleanup failed")
             mesh, self.mesh = self.mesh, None
             if mesh is not None:
                 with contextlib.suppress(Exception):
