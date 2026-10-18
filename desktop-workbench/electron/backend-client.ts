@@ -167,10 +167,16 @@ export class DesktopBackendClient {
     this.stream = null;
     const child = this.child;
     if (!child) return;
+    // `send` on a closed channel emits `error` asynchronously, which a
+    // try/catch cannot see; guard the channel and keep a listener for the race.
+    const ignoreChannelError = () => undefined;
+    child.on("error", ignoreChannelError);
     try {
-      child.send({ type: "shutdown" } satisfies BackendControlMessage);
+      if (child.connected) child.send({ type: "shutdown" } satisfies BackendControlMessage);
     } catch {
       // The channel is already gone; the exit race below handles it.
+    } finally {
+      child.off("error", ignoreChannelError);
     }
     const exited = await Promise.race([
       this.exitPromise?.then(() => true) ?? Promise.resolve(true),
