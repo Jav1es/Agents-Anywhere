@@ -6,12 +6,42 @@ import path from "node:path";
 import test from "node:test";
 import { DesktopBindingStore } from "./desktop-binding";
 import { DesktopSettingsStore, NPMMIRROR_PYTHON_BUILDS } from "./desktop-settings";
-import { ConnectorSupervisor } from "./connector-supervisor";
+import { ConnectorSupervisor, type ConnectorChannel } from "./connector-supervisor";
 import { bundledPythonExecutable } from "./connector-python";
 import { ConnectorLogStore } from "./log-store";
 import { ConnectorRpcError } from "./connector-rpc-error";
 import type { OwnershipState } from "./local-runtime";
 import type { ConnectorLogEntry } from "./connector-types";
+
+/** What the supervisor needs from one Connector's control channel. */
+function fakeChannel(behavior: { conflict?: () => boolean } = {}): ConnectorChannel {
+  const state = (running: boolean) => ({ running, authFailed: false, status: running ? "running" : "stopped" });
+  const stayOpen = async function* (_since: number | null, options?: { signal?: AbortSignal }) {
+    await new Promise<void>(resolve => {
+      if (options?.signal?.aborted) resolve();
+      else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
+  };
+  return {
+    control: {
+      getState: async () => state(false),
+      acquireOwnership: async () => {
+        if (behavior.conflict?.()) throw { code: "connector_already_running", details: { owner: { kind: "cli", pid: 1234 } } };
+        return state(false);
+      },
+      saveConfig: async () => state(false),
+      start: async () => {
+        if (behavior.conflict?.()) throw { code: "connector_already_running", details: { owner: { kind: "cli", pid: 1234 } } };
+        return state(true);
+      },
+      stop: async () => state(false),
+      restart: async () => state(true),
+      events: stayOpen,
+    },
+    logs: { tail: stayOpen },
+    close: async () => {},
+  };
+}
 
 // Exercise real stdio provisioning without downloading Python or running an AA server.
 const runtime = `
@@ -23,10 +53,9 @@ fs.writeFileSync(process.argv[2], JSON.stringify({
   pipIndex: process.env.PIP_INDEX_URL,
   pythonMirror: process.env.UV_PYTHON_INSTALL_MIRROR,
 }));
-readline.createInterface({ input: process.stdin }).on('line', line => {
-  const request = JSON.parse(line);
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { running: false, status: 'stopped' } }) + '\\n');
-});
+process.stdout.write(JSON.stringify({ kind: 'connector.ready', version: 1, instanceId: 'fake', pid: process.pid, endpoint: { unixPath: '/nonexistent/fake.sock' }, key: 'mk_host_fake' }) + '\\n');
+process.stdin.resume();
+process.stdin.on('end', () => process.exit(0));
 
 `;
 
@@ -65,6 +94,7 @@ test("first pre-login provisioning receives the initialized mirror and honors sa
       binding: new DesktopBindingStore(path.join(root, "binding.json")),
       logs: new ConnectorLogStore(path.join(root, "logs"), () => settings.get()),
       onState: () => {}, onLog: () => {},
+      connectControl: async () => fakeChannel(),
     });
     try {
       await supervisor.preflightProvisioning();
@@ -83,15 +113,9 @@ test("Python ownership conflicts reach the Desktop gate, retain credentials and 
   const script = path.join(root, "runtime.cjs");
   const ready = path.join(root, "owner-stopped");
   fs.writeFileSync(script, `
-const fs = require('node:fs');
-require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
-  const request = JSON.parse(line);
-  const conflict = ['connector.acquireOwnership', 'connector.start'].includes(request.method) && !fs.existsSync(process.argv[2]);
-  const response = conflict
-    ? { error: { code: -32009, message: 'Another Connector is running.', data: { reason: 'connector_already_running', owner: { kind: 'cli', pid: 1234 } } } }
-    : { result: { running: request.method === 'connector.start', status: request.method === 'connector.start' ? 'running' : 'stopped' } };
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, ...response }) + '\\n');
-});
+process.stdout.write(JSON.stringify({ kind: 'connector.ready', version: 1, instanceId: 'fake', pid: process.pid, endpoint: { unixPath: '/nonexistent/fake.sock' }, key: 'mk_host_fake' }) + '\\n');
+process.stdin.resume();
+process.stdin.on('end', () => process.exit(0));
 `);
   const configPath = path.join(root, "connector.json");
   const credentials = { serverUrl: "https://example.test", connectorId: "desktop-id", connectorToken: "private-token" };
@@ -117,6 +141,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
     binding: new DesktopBindingStore(path.join(root, "binding.json")),
     logs: new ConnectorLogStore(path.join(root, "logs"), () => settings.get()),
     onOwnership: state => ownership.push(state), onState: () => {}, onLog: entry => logs.push(entry.message),
+    connectControl: async () => fakeChannel({ conflict: () => !fs.existsSync(ready) }),
   });
   try {
     const isConflict = (error: unknown) => error instanceof ConnectorRpcError && error.ownershipConflict && error.code === -32009;
@@ -196,10 +221,9 @@ test("development launches the bundled uv instead of the developer's PATH", { ti
   fs.writeFileSync(bundledUv, "");
   const script = path.join(root, "runtime.cjs");
   fs.writeFileSync(script, `
-require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
-  const request = JSON.parse(line);
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { running: false, status: 'stopped' } }) + '\\n');
-});
+process.stdout.write(JSON.stringify({ kind: 'connector.ready', version: 1, instanceId: 'fake', pid: process.pid, endpoint: { unixPath: '/nonexistent/fake.sock' }, key: 'mk_host_fake' }) + '\\n');
+process.stdin.resume();
+process.stdin.on('end', () => process.exit(0));
 `);
   const settings = new DesktopSettingsStore(path.join(root, "settings.json"), ["en-US"]);
   const spawn = childProcess.spawn;
@@ -215,6 +239,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
     binding: new DesktopBindingStore(path.join(root, "binding.json")),
     logs: new ConnectorLogStore(path.join(root, "logs"), () => settings.get()),
     onState: () => {}, onLog: () => {},
+    connectControl: async () => fakeChannel(),
   });
   try {
     await supervisor.getState();
@@ -244,10 +269,9 @@ test("the bundled Python pins the Connector environment, and replacing another i
   }
   const script = path.join(root, "runtime.cjs");
   fs.writeFileSync(script, `
-require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
-  const request = JSON.parse(line);
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { running: false, status: 'stopped' } }) + '\\n');
-});
+process.stdout.write(JSON.stringify({ kind: 'connector.ready', version: 1, instanceId: 'fake', pid: process.pid, endpoint: { unixPath: '/nonexistent/fake.sock' }, key: 'mk_host_fake' }) + '\\n');
+process.stdin.resume();
+process.stdin.on('end', () => process.exit(0));
 `);
   const configPath = path.join(root, "connector.json");
   const settings = new DesktopSettingsStore(path.join(root, "settings.json"), ["en-US"]);
@@ -268,6 +292,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
     binding: new DesktopBindingStore(path.join(root, "binding.json")),
     logs: new ConnectorLogStore(path.join(root, "logs"), () => settings.get()),
     onOwnership: state => ownership.push(state), onState: () => {}, onLog: () => {},
+    connectControl: async () => fakeChannel(),
   });
   // Acquire ownership over a project environment whose pyvenv.cfg records
   // `home` (none when null) and report whether that counted as provisioning.
