@@ -9,13 +9,12 @@ from pathlib import Path
 
 import httpx
 
-from connector.control import ConnectorController
 from connector.core.config import ConnectorConfig
-from connector.core.json_rpc import JsonRpcStdioServer, open_stdio_server
 from connector.core.runtime_owner import (
     RuntimeLease,
 )
-from connector.logging import configure_connector_logging, install_rpc_log_sink
+from connector.logging import configure_connector_logging
+from connector.mesh.host import serve_host
 from connector.server.client import BackendRpcClient
 from connector.server.pairing import (
     poll_pairing,
@@ -155,37 +154,7 @@ async def _start(args: argparse.Namespace) -> None:
 
 
 async def _rpc(args: argparse.Namespace) -> None:
-    server: JsonRpcStdioServer | None = None
-
-    async def notify(method: str, params: object) -> None:
-        if server is not None:
-            await server.notify(method, params)
-
-    controller = ConnectorController(config_path=args.config, notifier=notify)
-    handlers = {
-        "connector.acquireOwnership": controller.acquire_ownership,
-        "connector.getState": controller.get_state,
-        "connector.getPaths": controller.get_paths,
-        "connector.getConfig": controller.get_config,
-        "connector.saveConfig": controller.save_config,
-        "connector.start": controller.start,
-        "connector.stop": controller.stop,
-        "connector.restart": controller.restart,
-        "connector.startPairing": controller.start_pairing,
-        "connector.cancelPairing": controller.cancel_pairing,
-    }
-    log_level = "DEBUG" if args.debug else "INFO"
-    log_sink = install_rpc_log_sink(
-        notify,
-        level=log_level,
-        remove_default_sink=True,
-    )
-    server = await open_stdio_server(handlers)
-    try:
-        await server.serve_forever()
-    finally:
-        await controller.shutdown()
-        await log_sink.close()
+    await serve_host(config_path=args.config, debug=args.debug)
 
 
 async def _pair(args: argparse.Namespace) -> None:

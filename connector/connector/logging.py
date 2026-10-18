@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from loguru import logger as logger
 
-
-RpcLogNotifier = Callable[[str, Any], Awaitable[None]]
+# Loguru calls sinks from whichever thread logged, so a synchronous, thread-safe
+# notifier is preferred; a coroutine notifier needs a running loop there.
+RpcLogNotifier = Callable[[str, Any], Awaitable[None] | None]
 DEFAULT_LOG_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
     "<level>{level: <8}</level> | "
@@ -59,7 +61,10 @@ class RpcLogSink:
         if exception is not None:
             payload["exception"] = str(exception)
 
-        task = asyncio.create_task(self.notifier("connector/log", payload))
+        result = self.notifier("connector/log", payload)
+        if not inspect.isawaitable(result):
+            return
+        task = asyncio.ensure_future(result)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
