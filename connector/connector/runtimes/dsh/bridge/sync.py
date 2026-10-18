@@ -115,6 +115,9 @@ class SyncRelay:
         self.expected_batch = 1
         self.confirmed = asyncio.Event()
         self.ingest_lock = asyncio.Lock()
+        # MeshCall runs each ingest call on its own task; close() cancels them
+        # so a blocked upload cannot hold the lock during shutdown.
+        self._ingest_tasks: set[asyncio.Task[Any]] = set()
         self.retry_delay = retry_delay
         self.on_exit = on_exit
         self.failures = 0
@@ -163,6 +166,11 @@ class SyncRelay:
         if self.task and self.task is not asyncio.current_task():
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
+        tasks = list(self._ingest_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         retries = list(self.retry_tasks)
         for retry in retries:
             retry.cancel()
@@ -456,6 +464,16 @@ class SyncRelay:
     async def ingest(self, batch: SyncBatch) -> None:
         """Run one batch; returning is the plugin's acknowledgement."""
         await asyncio.wait_for(self.confirmed.wait(), SUBSCRIBE_CONFIRM_TIMEOUT_SECONDS)
+        task = asyncio.current_task()
+        if task is not None:
+            self._ingest_tasks.add(task)
+        try:
+            await self._ingest_locked(batch)
+        finally:
+            if task is not None:
+                self._ingest_tasks.discard(task)
+
+    async def _ingest_locked(self, batch: SyncBatch) -> None:
         async with self.ingest_lock:
             if batch.subscriptionId != self.subscription_id or self.projection_version is None:
                 raise ValueError("Batch for a subscription that already ended")
@@ -491,12 +509,15 @@ class SyncRelay:
 
     async def begin_snapshot(self, request: SnapshotRequest) -> None:
         self.clear_snapshot()
-        self.snapshot = {"sessionId": request.sessionId, "meta": request.meta, "throughSeq": request.throughSeq}
+        self.snapshot = {"captureId": request.captureId, "sessionId": request.sessionId,
+                         "meta": request.meta, "throughSeq": request.throughSeq}
 
     async def add_snapshot_page(self, page: SnapshotPage) -> None:
         snapshot = self.snapshot
         if snapshot is None:
             raise ValueError("Snapshot page outside a capture")
+        if page.captureId != snapshot["captureId"]:
+            raise ValueError("Snapshot page belongs to a different capture")
         for raw in page.items:
             item = timeline_item(raw)
             if item.session_id != snapshot["sessionId"] or item.id in self.item_ids:
@@ -504,10 +525,12 @@ class SyncRelay:
             self.item_ids.add(item.id)
         await self.store_items(page.items)
 
-    async def commit_snapshot(self) -> SnapshotResult:
+    async def commit_snapshot(self, capture_id: str | None = None) -> SnapshotResult:
         snapshot = self.snapshot
         if snapshot is None:
             raise ValueError("Snapshot commit outside a capture")
+        if capture_id is not None and snapshot.get("captureId") != capture_id:
+            raise ValueError("Snapshot commit belongs to a different capture")
         session_id = snapshot["sessionId"]
         await self.deliver_snapshot(session_id, snapshot)
         self.clear_snapshot()
@@ -516,7 +539,10 @@ class SyncRelay:
             return SnapshotResult(accepted=True)
         return SnapshotResult(accepted=False, quarantined=True, reason=record.reason)
 
-    async def abort_snapshot(self) -> None:
+    async def abort_snapshot(self, capture_id: str | None = None) -> None:
+        # A stale stream must not clear the capture its replacement started.
+        if capture_id is not None and self.snapshot is not None and self.snapshot.get("captureId") != capture_id:
+            return
         self.clear_snapshot()
 
 

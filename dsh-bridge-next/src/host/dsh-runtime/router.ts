@@ -44,7 +44,17 @@ export class RuntimeRouter {
 
   constructor(private readonly reader: SessionReader, readonly namespace: string) {}
 
+  private readonly closing = new AbortController()
+  /** Aborted once this router is torn down; open sync streams end with it. */
+  get closed(): AbortSignal { return this.closing.signal }
+
   close(): void { this.feed?.close(); this.feed = undefined }
+
+  /** Stop this namespace for good: open streams end instead of waiting for drain. */
+  shutdown(): void {
+    this.close()
+    this.closing.abort()
+  }
 
   /** Replace this namespace's event feed; `failed` reports why a running feed stopped. */
   subscribe(subscriptionId: string, durableCheckpoints: boolean, transport: SyncTransport,

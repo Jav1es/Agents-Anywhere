@@ -1,4 +1,5 @@
 import { jsonBytes } from './json-size.js'
+import { randomUUID } from 'node:crypto'
 import { receiptKey } from './attachments.js'
 import type { SnapshotPage, SnapshotRequest, SnapshotResult, SyncBatch as WireBatch } from '../generated/dsh-sync.js'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -18,7 +19,7 @@ export interface SyncTransport {
   loadCheckpoint(externalSessionId: string): Promise<Record<string, unknown> | null>
   saveCheckpoint(externalSessionId: string, checkpoint: SyncCheckpoint): Promise<void>
   deleteCheckpoint(externalSessionId: string): Promise<void>
-  ingestSnapshot(request: SnapshotRequest, pages: AsyncIterable<SnapshotPage>): Promise<SnapshotResult>
+  ingestSnapshot(request: SnapshotRequest, pages: AsyncIterable<SnapshotPage>, signal: AbortSignal): Promise<SnapshotResult>
 }
 
 function matchesCheckpoint(value: unknown, projection: SessionProjection): boolean {
@@ -157,17 +158,17 @@ export class SyncFeed {
     if (page.length && await this.native.visible(id)) await sendPage()
   }
   /** Snapshot pages for one capture, bounded like the old snapshot.items frames. */
-  private async *pages(items: TimelineItem[]): AsyncIterable<SnapshotPage> {
+  private async *pages(items: TimelineItem[], captureId: string): AsyncIterable<SnapshotPage> {
     let page: TimelineItem[] = [], bytes = 0
     for (const item of items) {
       const size = jsonBytes(item)
       if (size > MAX_BYTES) throw new Error('A DSH Timeline item exceeds the transport limit')
       if (page.length && (bytes + size > MAX_BYTES || page.length >= 250)) {
-        yield { items: page as unknown as Record<string, unknown>[] }; page = []; bytes = 0
+        yield { captureId, items: page as unknown as Record<string, unknown>[] }; page = []; bytes = 0
       }
       page.push(item); bytes += size
     }
-    if (page.length) yield { items: page as unknown as Record<string, unknown>[] }
+    if (page.length) yield { captureId, items: page as unknown as Record<string, unknown>[] }
   }
   private async baseline(id: string, restore = false): Promise<void> {
     await this.sessionOperation(id, 'snapshot', () => this.publishBaseline(id, restore))
@@ -218,8 +219,10 @@ export class SyncFeed {
     if (!await this.native.visible(id)) return
     this.native.diagnostics.log('debug', 'snapshot.started', { streamId: this.id, sessionId: id })
     const snapshotItems = contentItems(projection.snapshot())
-    const result = await this.delivery(() => this.transport.ingestSnapshot({ subscriptionId: this.id, sessionId: platformId,
-      meta, throughSeq: projection.throughSeq }, this.pages(snapshotItems)))
+    // A capture id keeps a cancelled stream's pages from landing in the next capture.
+    const captureId = randomUUID()
+    const result = await this.delivery(() => this.transport.ingestSnapshot({ captureId, subscriptionId: this.id, sessionId: platformId,
+      meta, throughSeq: projection.throughSeq }, this.pages(snapshotItems, captureId), this.abort.signal))
     if (!result.accepted) {
       // Permanently refused: the Connector already published the session as unavailable.
       this.failedSessions.set(id, { availability: 'unavailable', reason: (result.reason ?? 'sync_failed') as string, observedAt: new Date().toISOString() })
@@ -402,13 +405,14 @@ export class SyncFeed {
     // capability update incurs a separate transport round trip per session.
     this.bufferedOperations = []
     await this.changes(this.takeChanges())
-    await this.rememberCheckpoints()
     const sessions = []
     for (const id of this.native.candidates()) sessions.push({ sessionId: sessionId(this.namespace, id),
       externalSessionId: id, sourceState: await this.sourceState(id) })
     await this.notification('session.inventory.complete', { scanToken: this.id, complete: true,
       sessions })
     await this.flushOperations()
+    // Checkpoints cover the data above: save only after the batch was ingested.
+    await this.rememberCheckpoints()
     this.bufferedOperations = undefined
     this.native.diagnostics.log('info', 'sync.inventory_completed', { streamId: this.id, sessions: this.published.size })
     while (!this.closed) {
@@ -419,10 +423,9 @@ export class SyncFeed {
       await delay(SYNC_FLUSH_MS, undefined, { signal: this.abort.signal })
       this.bufferedOperations = []
       await this.changes(this.takeChanges())
-      // Keep checkpoints behind their data in the same frame. The Connector
-      // ingests the notifications before saving them, without another RTT per turn.
-      await this.rememberCheckpoints()
+      // The checkpoint covers this frame's data, so the batch must be ingested first.
       await this.flushOperations()
+      await this.rememberCheckpoints()
       this.bufferedOperations = undefined
     }
   }

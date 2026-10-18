@@ -226,16 +226,26 @@ class LocalHub:
 
     async def mount(self, *services: object) -> None:
         """Serve the given services on this Mesh; mounting after start restarts serving."""
-        mesh = self.mesh
-        if mesh is None:
-            raise RuntimeError("The local router is not started")
-        if self._server is not None:
+        async with self._lock:
+            if self._stopping:
+                raise RuntimeError("The local router is stopping")
+            if self.router is None or not self.router.is_running or self.mesh is None:
+                # The supervisor may be waiting to restart a crashed Router; a
+                # mount must not try to start it without the auth file and sweep.
+                with contextlib.suppress(Exception):
+                    if self.router is not None:
+                        await self.router.stop()
+                await self._launch()
+            mesh = self.mesh
+            if mesh is None:
+                raise RuntimeError("The local router is not started")
             await self._stop_serving()
-        mesh.mount(*services, instance_id=f"connector-{self.instance_id}")
-        self._services.extend(services)
-        await self._start_serving()
+            mesh.mount(*services, instance_id=f"connector-{self.instance_id}")
+            self._services.extend(services)
+            await self._start_serving()
 
     async def stop(self) -> None:
+        self._stopping = True
         cleanups, self._cleanups = self._cleanups, []
         for cleanup in reversed(cleanups):
             try:
@@ -243,7 +253,6 @@ class LocalHub:
             except Exception:  # noqa: BLE001 - one failed cleanup must not keep the Router alive.
                 logger.exception("local router cleanup failed")
         async with self._lock:
-            self._stopping = True
             supervisor, self._supervisor = self._supervisor, None
             if supervisor is not None:
                 supervisor.cancel()
@@ -279,13 +288,19 @@ class LocalHub:
         logger.info("local router listening endpoint={}", self.endpoint.to_json())
 
     async def _start_serving(self) -> None:
-        assert self.mesh is not None
+        if self.mesh is None:
+            raise RuntimeError("The local router is not started")
         self._serve = self.mesh.serve(log_level="DEBUG")
         self._server = await self._serve.__aenter__()
 
     async def _stop_serving(self) -> None:
+        server, self._server = self._server, None
+        if server is not None:
+            # Control/Logs streams never finish; draining them would stall for
+            # the whole drain timeout (Desktop and the plugin keep them open).
+            with contextlib.suppress(Exception):
+                await server.stop(drain=False)
         serve, self._serve = self._serve, None
-        self._server = None
         if serve is not None:
             with contextlib.suppress(Exception):
                 await serve.__aexit__(None, None, None)
@@ -297,6 +312,13 @@ class LocalHub:
             if self._stopping or router is None:
                 return
             if router.is_running:
+                if self._services and self._server is None:
+                    async with self._lock:
+                        if not self._stopping and self._server is None:
+                            try:
+                                await self._start_serving()
+                            except Exception:  # noqa: BLE001 - retry on the next tick.
+                                logger.exception("local router serving restart failed")
                 continue
             logger.warning("local router exited; restarting")
             await asyncio.sleep(_RESTART_DELAY)
@@ -307,7 +329,9 @@ class LocalHub:
                     with contextlib.suppress(Exception):
                         await self.router.stop()
                     await self._launch()
-                    # The server driver re-registers by itself; a Mesh client reconnects per call.
+                    if self._services:
+                        # The old server handle died with the Router; publish the services again.
+                        await self._start_serving()
                 except Exception:  # noqa: BLE001 - keep watching; peers report the Router gone meanwhile.
                     logger.exception("local router restart failed")
 

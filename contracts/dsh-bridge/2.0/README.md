@@ -4,7 +4,7 @@ DSH 插件（`dsh-bridge-next`）与 Connector 之间的本机协议。2.0 用 M
 
 ## 拓扑与发现
 
-- Connector 进程（`anywhere-cli rpc`）启动时拉起一个 MeshCall `LocalRouter`：macOS/Linux 用 `~/.agents-anywhere/router/<instanceId>.sock`，Windows 用命名管道 `agents-anywhere-<instanceId>`。Router 随 Connector 退出；意外退出由 Connector 监督重启，endpoint 与 key 不变。
+- Connector 进程（`anywhere-cli rpc`）启动时拉起一个 MeshCall `LocalRouter`：macOS/Linux 用 `~/.agents-anywhere/router/<instanceId>.sock`（路径超过 103 字节时退到系统临时目录），Windows 用命名管道 `agents-anywhere-<instanceId>`。Router 随 Connector 退出；意外退出由 Connector 监督重启，endpoint 与 key 不变。
 - Connector 注册 `aa.local.v2.Control`、`aa.local.v2.Logs`、`aa.dsh.v2.Sync`，并在 `<用户主目录>/.agents-anywhere/dsh-bridge/connector.json` 发布rendezvous（0600，原子替换）：
 
 ```json
@@ -55,11 +55,11 @@ API key 形如 `mk_<id>_<随机 hex>`，Router 按 id 查表并比对 SHA-256。
 | `loadCheckpoint` | unary | `{subscriptionId, externalSessionId}` → `{checkpoint}` |
 | `saveCheckpoint` | unary | `{subscriptionId, externalSessionId, checkpoint}` |
 | `deleteCheckpoint` | unary | `{subscriptionId, externalSessionId}` |
-| `ingestSnapshot` | 客户端流 | 请求 `{subscriptionId, sessionId, meta, throughSeq}` + 页流 `{items[]}` → `{accepted, quarantined, reason?}` |
+| `ingestSnapshot` | 客户端流 | 请求 `{captureId, subscriptionId, sessionId, meta, throughSeq}` + 页流 `{captureId, items[]}` → `{accepted, quarantined, reason?}` |
 
 - 批次按 `batchSeq` 严格递增；乱序或 `subscriptionId` 未知是错误，由插件重新订阅。
 - 检查点只在覆盖的历史被 Server 接受之后保存；被隔离的会话不保存检查点。
-- 快照页流可取消（调用取消即中止）；提交被永久拒绝时返回 `accepted:false` 并给出隔离原因 `history_too_large` / `history_rejected`。
+- 快照页流可取消（调用取消即中止）；`captureId` 让被取消的旧流无法污染下一次捕获。提交被永久拒绝时返回 `accepted:false` 并给出隔离原因 `history_too_large` / `history_rejected`。
 - 隔离、退避重捕（30 s 起，超大 5 min 起，上限 30 min）、健康上报（`starting/syncing → running`）、单会话失败隔离与 1.0 相同。
 - 不再有上传进度续期：一次 ingest 调用就是一个慢请求，连接由 MeshCall keepalive 维持。
 
@@ -89,4 +89,4 @@ Desktop 主进程是 CommonJS，生成文件的 `import type ... from "meshcall"
 
 ## 兼容
 
-硬切 2.0：旧 Connector 读到 rendezvous v2 时提示升级；插件不再写 1.0 的 endpoint 镜像（`<DSH_HOME>/agents-anywhere/bridge/endpoint.json`）。插件与 Connector 的接口更新按仓库版本规则升 MINOR。
+硬切 2.0：旧 Connector 只读 1.0 的 `endpoint.json`，不会读取 rendezvous v2，因此会一直停在“等待 DSH”，用户需要一起升级三端；插件也不再写 1.0 的 endpoint 镜像（`<DSH_HOME>/agents-anywhere/bridge/endpoint.json`）。插件与 Connector 的接口更新按仓库版本规则升 MINOR。

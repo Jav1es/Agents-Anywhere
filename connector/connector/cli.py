@@ -104,7 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--connector-token", required=True, help="connector token")
 
     rpc = subparsers.add_parser(
-        "rpc", help="serve the desktop connector JSON-RPC API over stdio"
+        "rpc", help="serve the local control API (MeshCall) for the desktop app and plugins"
     )
     _add_config_args(rpc)
     _add_debug_arg(rpc)

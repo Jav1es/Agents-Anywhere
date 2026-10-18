@@ -13,6 +13,8 @@ from connector.runtimes.dsh.bridge.host import (
 )
 from connector.runtimes.dsh.bridge.sync import SyncRelay
 
+CAPTURE_ID = "capture"
+
 
 def ready_relay(receiver: Any, *, durable: bool = True, projection: int = 3) -> SyncRelay:
     """A relay in the state ``subscribe()`` leaves it in once the plugin confirmed the stream."""
@@ -46,6 +48,7 @@ async def begin_snapshot(
     through_seq: int = 0,
 ) -> None:
     await relay.begin_snapshot(SnapshotRequest(
+        captureId=CAPTURE_ID,
         subscriptionId=relay.subscription_id or "",
         sessionId=session_id,
         meta=meta or {"externalSessionId": "native"},
@@ -54,4 +57,4 @@ async def begin_snapshot(
 
 
 async def add_page(relay: SyncRelay, items: list[dict[str, Any]]) -> None:
-    await relay.add_snapshot_page(SnapshotPage(items=items))
+    await relay.add_snapshot_page(SnapshotPage(captureId=CAPTURE_ID, items=items))

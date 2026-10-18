@@ -9,6 +9,7 @@ Router, down; nothing else is ever written to stdout.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
 import threading
@@ -41,7 +42,12 @@ async def wait_for_stdin_eof(stream: Any = None) -> None:
                 pass
         except (OSError, ValueError):
             pass
-        loop.call_soon_threadsafe(lambda: closed.done() or closed.set_result(None))
+        def close() -> None:
+            if not closed.done():
+                closed.set_result(None)
+
+        with contextlib.suppress(RuntimeError):  # the loop already closed during shutdown
+            loop.call_soon_threadsafe(close)
 
     threading.Thread(target=read, name="connector-stdin-watch", daemon=True).start()
     await closed
@@ -69,9 +75,11 @@ async def serve_host(
         output.flush()
         await wait_for_stdin_eof(stdin)
     finally:
+        set_local_hub(None)
         try:
             await controller.shutdown()
         finally:
-            await hub.stop()
-            set_local_hub(None)
-            await log_sink.close()
+            try:
+                await hub.stop()
+            finally:
+                await log_sink.close()

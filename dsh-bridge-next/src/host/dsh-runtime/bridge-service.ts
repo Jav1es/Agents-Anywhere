@@ -74,7 +74,8 @@ export class BridgeService {
   }
 
   close(): void {
-    for (const router of this.routers.values()) router.close()
+    // Open sync streams end promptly so a Mesh drain does not wait for them.
+    for (const router of this.routers.values()) router.shutdown()
     this.routers.clear()
   }
 
@@ -170,6 +171,7 @@ export class BridgeService {
       })
     const onAbort = () => stopped()
     context.signal.addEventListener('abort', onAbort, { once: true })
+    router.closed.addEventListener('abort', onAbort, { once: true })
     try {
       yield { kind: 'subscribed', projectionVersion: PROJECTION_VERSION, ...(request.checkpointVersion === 1 ? { checkpointVersion: 1 } : {}) }
       feed.start()
@@ -177,6 +179,7 @@ export class BridgeService {
       if (failure !== undefined) throw bridgeFailure(failure instanceof BridgeError ? failure : new BridgeError('INTERNAL_ERROR', 'DSH event sync stopped; resubscribe.', true))
     } finally {
       context.signal.removeEventListener('abort', onAbort)
+      router.closed.removeEventListener('abort', onAbort)
       router.unsubscribe(feed)
     }
   }

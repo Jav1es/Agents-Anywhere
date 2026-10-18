@@ -34,6 +34,8 @@ import { LogsServiceClient } from "./generated/connector-logs";
  * deadline.
  */
 const FIRST_RUN_TIMEOUT_MS = 15 * 60_000;
+/** The Connector restarts its Router within a couple of seconds; wait it out. */
+const CONTROL_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const PYTHON_BUILDS_GITHUB = "https://github.com/astral-sh/python-build-standalone/releases/download";
 const UV_HTTP_TIMEOUT_SECONDS = "60";
@@ -454,24 +456,50 @@ export class ConnectorSupervisor {
     if (!ready) return;
     const rendezvous = parseRendezvous(line);
     if (!rendezvous) {
-      // stdout carries exactly one line: the ready message. Anything else is a protocol error.
+      // stdout carries exactly one line: the ready message. Anything else is a
+      // protocol error with no recovery path, so restart the process.
       ready.reject(new Error(`Connector RPC emitted an unexpected line: ${line.slice(0, RECENT_OUTPUT_LINE_LENGTH)}`));
+      void this.terminateRpcProcess();
       return;
     }
     this.log({ level: "INFO", message: `Connector ready (${rendezvous.instanceId})` });
-    void this.connect(rendezvous).then(channel => ready.resolve(channel), error => ready.reject(error));
+    void this.connect(rendezvous, ready).then(
+      channel => ready.resolve(channel),
+      error => {
+        ready.reject(error);
+        void this.terminateRpcProcess();
+      },
+    );
   }
 
-  private async connect(rendezvous: Rendezvous): Promise<ConnectorChannel> {
+  private async connect(rendezvous: Rendezvous, ready: { promise: Promise<ConnectorChannel> }): Promise<ConnectorChannel> {
+    const fresh = () => this.ready === ready && this.rpcProcess !== null;
     if (this.options.connectControl) {
       const channel = await this.options.connectControl(rendezvous);
+      if (!fresh()) { await channel.close?.().catch(() => undefined); throw new Error("Connector 进程在连接期间已退出。"); }
       this.channel = channel;
       this.watchStreams(channel);
       return channel;
     }
     const { Mesh, Router } = await import("meshcall");
     const mesh = new Mesh(new Router(rendezvous.endpoint), { token: rendezvous.key, peerId: `desktop-workbench-${rendezvous.instanceId}` });
-    await mesh.connect();
+    const deadline = Date.now() + CONTROL_CONNECT_TIMEOUT_MS;
+    let backoff = 200;
+    for (;;) {
+      try { await mesh.connect(); break; } catch (error) {
+        // The Connector owns the Router and restarts it; the endpoint and key stay the same.
+        if (!fresh() || Date.now() >= deadline) {
+          await mesh.close().catch(() => undefined);
+          throw error;
+        }
+        await new Promise(resolve => setTimeout(resolve, backoff));
+        backoff = Math.min(backoff * 2, 1_000);
+      }
+    }
+    if (!fresh()) {
+      await mesh.close().catch(() => undefined);
+      throw new Error("Connector 进程在连接期间已退出。");
+    }
     this.mesh = mesh;
     const channel: ConnectorChannel = { control: new ControlServiceClient(mesh), logs: new LogsServiceClient(mesh) };
     this.channel = channel;
@@ -508,14 +536,21 @@ export class ConnectorSupervisor {
 
   private handleEvent(event: unknown): void {
     if (!event || typeof event !== "object") return;
-    const value = event as { kind?: string; state?: unknown; level?: string; message?: string; name?: string; exception?: string | null };
+    const value = event as { kind?: string; state?: unknown; level?: string; message?: string; time?: string; name?: string; exception?: string | null };
     if (value.kind === "state") {
       this.mergeRuntimeState(value.state);
       this.emitState();
       return;
     }
     if (typeof value.message === "string") {
-      this.log({ level: value.level ?? "INFO", message: value.message });
+      // Keep the Connector's timestamp, module and traceback; the store redacts secrets.
+      this.log({
+        level: value.level ?? "INFO",
+        message: value.message,
+        ...(value.time ? { time: value.time } : {}),
+        ...(value.name ? { name: value.name } : {}),
+        ...(value.exception ? { exception: value.exception } : {}),
+      });
     }
   }
 

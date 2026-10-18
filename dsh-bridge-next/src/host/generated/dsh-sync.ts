@@ -70,6 +70,7 @@ export interface SyncServiceDeleteCheckpointRequest {
 }
 
 export interface SnapshotRequest {
+  captureId: string;
   subscriptionId: string;
   sessionId: string;
   meta: Record<string, unknown>;
@@ -119,6 +120,7 @@ export const SnapshotResultSchema: JsonSchema = {
 };
 
 export interface SnapshotPage {
+  captureId: string;
   items: Array<Record<string, unknown>>;
 }
 

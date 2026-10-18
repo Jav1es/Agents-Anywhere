@@ -20,6 +20,9 @@ CONNECTOR_METADATA = "aa-connector-id"
 PROTOCOL_VERSION = "2.0"
 # How often the initial call checks whether the plugin registered its Bridge.
 DISCOVERY_RETRY_SECONDS = 0.1
+# The initial call waits for the plugin only this long; an offline DSH is
+# reported as waiting_bridge and the runtime's restart loop owns the polling.
+DISCOVERY_BUDGET_SECONDS = 2.0
 
 # MeshCall codes a 1.x caller knew under the plugin's error names.
 _PROTOCOL_CODES = {
@@ -105,8 +108,9 @@ class BridgeClient:
         # method; the plugin needs a moment to discover the Router and register.
         # Wait for it within startup_timeout instead of reporting the runtime down.
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.startup_timeout
-        timeout = self.startup_timeout
+        budget = min(self.startup_timeout, DISCOVERY_BUDGET_SECONDS)
+        deadline = loop.time() + budget
+        timeout = budget
         while True:
             try:
                 result = await self.request("initialize", {

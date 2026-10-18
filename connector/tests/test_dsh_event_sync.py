@@ -11,7 +11,12 @@ from connector.runtime_protocol import (
     RuntimeInstanceSpec,
     timeline_content_hash,
 )
-from connector.runtimes.dsh.bridge.host import SubscriptionRegistry, SyncBatch
+from connector.runtimes.dsh.bridge.host import (
+    SnapshotPage,
+    SnapshotRequest,
+    SubscriptionRegistry,
+    SyncBatch,
+)
 from connector.runtimes.dsh.bridge.sync import SyncRelay
 from connector.runtimes.dsh.runtime import DshRuntime
 from connector.server.runtime_host import ConnectorRuntimeHost
@@ -324,3 +329,29 @@ def test_inventory_does_not_report_healthy_while_delivery_is_pending_or_incomple
             await asyncio.gather(task, return_exceptions=True)
             await relay.close()
     asyncio.run(run())
+
+
+def test_snapshot_pages_and_aborts_from_another_capture_are_ignored():
+    async def exercise():
+        receiver = host()
+        relay = ready_relay(receiver)
+        await relay.begin_snapshot(SnapshotRequest(
+            captureId="new", subscriptionId="sub", sessionId="session",
+            meta={"externalSessionId": "native"}, throughSeq=3,
+        ))
+        with pytest.raises(ValueError, match="capture"):
+            await relay.add_snapshot_page(SnapshotPage(captureId="old", items=[item()]))
+        # A cancelled stream from the previous capture must not clear the new one.
+        await relay.abort_snapshot("old")
+        assert relay.snapshot is not None
+        assert relay.snapshot["captureId"] == "new"
+        with pytest.raises(ValueError, match="capture"):
+            await relay.commit_snapshot("old")
+        await relay.add_snapshot_page(SnapshotPage(captureId="new", items=[item()]))
+        result = await relay.commit_snapshot("new")
+        assert result.accepted is True
+        assert [n["method"] for n in receiver.publish_runtime_notifications.call_args.args[1]] == [
+            "session.meta.upsert", "timeline.sync",
+        ]
+
+    asyncio.run(exercise())

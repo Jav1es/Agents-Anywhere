@@ -25,8 +25,8 @@ export function parseRendezvous(text: string): Rendezvous | undefined {
   let value: Record<string, unknown>
   try { value = record(JSON.parse(text)) } catch { return undefined }
   const endpoint = record(value.endpoint)
-  const local = typeof endpoint.unixPath === 'string' ? { unixPath: endpoint.unixPath }
-    : typeof endpoint.pipe === 'string' ? { pipe: endpoint.pipe } : undefined
+  const local = typeof endpoint.unixPath === 'string' && endpoint.unixPath ? { unixPath: endpoint.unixPath }
+    : typeof endpoint.pipe === "string" && endpoint.pipe ? { pipe: endpoint.pipe } : undefined
   if (value.version !== 2 || value.protocol !== 'meshcall' || !local || typeof value.instanceId !== 'string' || !value.instanceId
     || typeof value.key !== 'string' || !value.key.startsWith('mk_') || typeof value.pid !== 'number') return undefined
   return { version: 2, protocol: 'meshcall', instanceId: value.instanceId, pid: value.pid, endpoint: local, key: value.key }
@@ -57,8 +57,8 @@ export class ConnectorSync implements SyncTransport {
     await this.client.deleteCheckpoint(this.subscriptionId, externalSessionId)
   }
 
-  async ingestSnapshot(request: SnapshotRequest, pages: AsyncIterable<SnapshotPage>): Promise<SnapshotResult> {
-    return this.client.ingestSnapshot(request, pages)
+  async ingestSnapshot(request: SnapshotRequest, pages: AsyncIterable<SnapshotPage>, signal: AbortSignal): Promise<SnapshotResult> {
+    return this.client.ingestSnapshot(request, pages, { signal })
   }
 }
 
@@ -81,6 +81,7 @@ export class BridgeConnection {
   private watcher: FSWatcher | undefined
   private lastFailure: string | undefined
   private closed = false
+  private closeTask: Promise<void> | undefined
 
   constructor(readonly rendezvousPath: string, reader: SessionReader,
     private readonly diagnostics: RuntimeDiagnostics = reader.native?.diagnostics ?? quietDiagnostics,
@@ -128,7 +129,9 @@ export class BridgeConnection {
   private check(): void {
     if (this.closed) return
     if (this.checking) { this.recheck = true; return }
-    this.checking = this.reconcile().finally(() => {
+    this.checking = this.reconcile().catch(error => {
+      this.failed('bridge.reconcile_failed', error)
+    }).finally(() => {
       this.checking = undefined
       if (this.recheck && !this.closed) { this.recheck = false; this.check() }
     })
@@ -172,10 +175,17 @@ export class BridgeConnection {
     if (!link) return
     this.service.close()
     this.diagnostics.log('info', 'bridge.disconnected', { connector: link.rendezvous.instanceId })
+    // Streams end with the router shutdown above; the timeout is a last resort.
+    await link.server.close({ drain: true, drainTimeoutMs: 1_000 }).catch(() => undefined)
     await link.mesh.close().catch(() => undefined)
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    // Idempotent and awaitable: a second caller waits for the same cleanup.
+    return this.closeTask ??= this.closing()
+  }
+
+  private async closing(): Promise<void> {
     if (this.closed) return
     this.closed = true
     if (this.timer) clearInterval(this.timer)

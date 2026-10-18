@@ -53,6 +53,7 @@ class CheckpointResult(BaseModel):
 class SnapshotRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    captureId: str = Field(min_length=1, max_length=128)
     subscriptionId: str
     sessionId: str
     meta: dict[str, Any]
@@ -60,6 +61,7 @@ class SnapshotRequest(BaseModel):
 
 
 class SnapshotPage(BaseModel):
+    captureId: str = Field(min_length=1, max_length=128)
     items: list[dict[str, Any]] = Field(min_length=1)
 
 
@@ -84,9 +86,9 @@ class SyncSubscriber(Protocol):
 
     async def add_snapshot_page(self, page: SnapshotPage) -> None: ...
 
-    async def commit_snapshot(self) -> SnapshotResult: ...
+    async def commit_snapshot(self, capture_id: str) -> SnapshotResult: ...
 
-    async def abort_snapshot(self) -> None: ...
+    async def abort_snapshot(self, capture_id: str) -> None: ...
 
 
 class SubscriptionRegistry:
@@ -162,10 +164,10 @@ class SyncService:
         try:
             async for page in items:
                 await run_on_loop(self._loop, subscriber.add_snapshot_page(page))
-            return await run_on_loop(self._loop, subscriber.commit_snapshot())
+            return await run_on_loop(self._loop, subscriber.commit_snapshot(request.captureId))
         except BaseException:
             with contextlib.suppress(Exception):
-                await run_on_loop(self._loop, subscriber.abort_snapshot())
+                await run_on_loop(self._loop, subscriber.abort_snapshot(request.captureId))
             raise
 
 

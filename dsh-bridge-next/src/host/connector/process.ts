@@ -212,6 +212,7 @@ export class SourceConnector implements ConnectorProcess {
       void this.logs.flush().catch(() => undefined)
       if (this.child === child) {
         this.child = null
+        void this.releaseControl()
         this.fail(new Error(`Connector 已退出（${code ?? '终止'}）。请在日志页切换到 Connector 查看原因。`), !this.stopping)
       }
     })
@@ -256,7 +257,7 @@ export class SourceConnector implements ConnectorProcess {
     const child = this.child
     this.events?.abort()
     this.events = null
-    if (!child) return
+    if (!child) { await this.releaseControl(); return }
     try { await this.control?.stop({ timeoutMs: 3_000 }) } catch { /* Child may not have finished starting. */ }
     child.stdin.end()
     const ended = new Promise<void>((resolve) => {
@@ -270,6 +271,11 @@ export class SourceConnector implements ConnectorProcess {
     if (!this.closed.has(child)) await this.terminate(child, true)
     await ended
     if (this.child === child) this.child = null
+    await this.releaseControl()
+  }
+
+  /** Close the Mesh a crashed Connector left behind; its reconnect loop never ends on its own. */
+  private async releaseControl(): Promise<void> {
     const mesh = this.mesh
     this.mesh = null
     this.control = null
