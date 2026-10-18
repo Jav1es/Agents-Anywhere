@@ -166,11 +166,11 @@ Host 配置位于 DSH 的插件配置行。常用项如下：
 
 Python 下载镜像独立于 PyPI 镜像，提供官方源与 npmmirror。首次初始化缺少该设置时，中文系统默认使用 npmmirror，其他语言使用官方源；已有的手动选择保持不变，恢复出厂设置重新应用语言默认值。选择通过 `UV_PYTHON_INSTALL_MIRROR` 传给 uv，仅影响解释器下载。`@dataiku/uv` 的平台可选依赖由包管理器安装，Host 直接执行其中的原生二进制，不要求 postinstall 脚本运行。
 
-日志页可以切换 Bridge 和 Connector。Connector 日志记录 uv/Python 的 stderr 与进程状态，按时间从上往下显示，首次及每次分页读取 200 行，滚到顶部加载更早记录。日志最多保留 10,000 行，写入前移除终端控制字符并脱敏凭据；stdout 保留为子进程 RPC 通道。日志在 `<stateRoot>/logs/connector-output.json` 中持久化，通过 Host RPC `readConnectorLogs` 分页读取。
+日志页可以切换 Bridge 和 Connector。Connector 日志记录 uv/Python 的 stderr 与进程状态，按时间从上往下显示，首次及每次分页读取 200 行，滚到顶部加载更早记录。日志最多保留 10,000 行，写入前移除终端控制字符并脱敏凭据；stdout 只用于 `anywhere-cli rpc` 启动时的一行就绪信息，控制调用走本机 MeshCall Router。日志在 `<stateRoot>/logs/connector-output.json` 中持久化，通过 Host RPC `readConnectorLogs` 分页读取。
 
 受限权限请求通过 DSH 官方 `approval/request` 转成 AA 交互通知，显示工具名与申请原因，提供“允许一次”和“拒绝”。结果通过官方待处理请求返回 DSH，不修改会话权限模式或批准策略。原生客户端作答或请求取消后，远端通知同步关闭；重连恢复同一个待处理请求，重复提交不会重复批准。计划审批 `plan-review` 复用问答卡片，展示完整计划正文和 DSH 提供的选项，也可填写修改意见。批准选项按 DSH 声明的标签匹配，不按位置推断；原生客户端作答、取消和重连沿用同一待处理请求。
 
-Bridge 的独占锁决定端点文件的写入权。获得锁后会重建残留或损坏的 `endpoint.json`，PID 仅用于诊断；关闭时只移除当前实例的端点，再释放锁。为兼容 2.0.3 之前的 Connector，端点还会复制到旧位置 `<dshHome>/agents-anywhere/bridge/endpoint.json`：写入前用同样的锁机制申请该目录，锁被 2.0.3 之前的插件占用时跳过；锁端口被系统保留（Windows 上的 EACCES）时不加锁照常写入，因为旧插件同样无法占用它。
+本机 Router 由 Connector 进程拥有（Unix socket 或 Windows 命名管道）；插件只负责发现与连接。插件不写端点文件：Connector 在 `~/.agents-anywhere/dsh-bridge/connector.json` 发布 rendezvous（endpoint + `dsh-bridge` key），插件读取后注册 `aa.dsh.v2.Bridge`，`instanceId` 或 key 变化时切换到新的 Router。插件管理锁（`acquireManagerLock`）仍防止两个插件实例同时注册，避免 Connector 的调用被分到两个 DSH 进程。旧的 `<dshHome>/agents-anywhere/bridge/endpoint.json` 镜像与 1.0 的 `initialize` 握手已删除。
 
 
 旧配置中的自动启动、心跳、重连及已有会话同步选项在加载时移除，不再影响连接行为。Host 重载自动恢复已授权设备；首次安装等待登录，仅 Desktop 正在运行时交由 Desktop 管理。同步间隔及固定的连接参数写入实际 `connector/connector.json`。`logs/connector.jsonl` 记录本机 Connector 生命周期。
@@ -181,7 +181,7 @@ Bridge 的独占锁决定端点文件的写入权。获得锁后会重建残留�
 
 本机共享记录固定为 `<操作系统用户主目录>/.agents-anywhere/connector-runtime.json`。Python Connector 统一负责启动互斥、运行 PID/启动来源和有序 Connector ID 历史，CLI 也在同一范围内。Desktop 只校验和发布安装信息；插件只读取共享记录，不写 ID、运行记录或安装信息。Desktop 与 Python 的短期文件事务保证并发写入不覆盖对方字段。
 
-插件先保存私有绑定，再通过 RPC 启动 Python Connector。Python 核验已有 PID 确实对应原来的 Connector 进程，接受启动时追加缺失 ID；冲突返回 `-32009 / connector_already_running`。插件展示错误并保留绑定供重试，关闭自己被拒绝的子进程；不会因冲突重复注册。正常退出后由 Python 清除自己的运行记录，异常退出后根据 PID 和进程身份判断残留记录；仅停止后端连接不会释放仍存活的 RPC 进程占用。
+插件先保存私有绑定，再通过 RPC 启动 Python Connector。Python 核验已有 PID 确实对应原来的 Connector 进程，接受启动时追加缺失 ID；冲突返回应用错误码 `connector_already_running`。插件展示错误并保留绑定供重试，关闭自己被拒绝的子进程；不会因冲突重复注册。正常退出后由 Python 清除自己的运行记录，异常退出后根据 PID 和进程身份判断残留记录；仅停止后端连接不会释放仍存活的 RPC 进程占用。
 
 默认插件数据统一放在 `~/.agents-anywhere/dsh-bridge-next/`；插件启动的 Connector 使用其 `connector/` 子目录，实例检查点和 KV 继续按 `<connectorId>/<runtimeId>/` 隔离。首次启动在读取账号和启动 Connector 前，从旧 `~/.agentsanywhere/dsh-bridge-next/` 复制全部持久数据，保留原文件；新目录已有文件优先。复制使用新旧目录的管理锁，旧插件仍运行时会报告冲突。复制失败会阻止管理器启动，修复后可重试。成功后的 `.legacy-state-migrated.json` 防止退出登录或重置后重新导入旧数据，请勿删除该记录。自动生成的 `connector-venv` 不复制，由 uv 在新位置重建；Connector 配置中指向旧根目录的状态路径随迁移更新。显式 `stateRoot` 不自动迁移，继续使用配置的位置。
 
@@ -195,7 +195,7 @@ Bridge 的独占锁决定端点文件的写入权。获得锁后会重建残留�
 
 点击该按钮由 Host 重新校验安装记录，生成一次性 `flowId`，再通过 `agents-anywhere-desktop://onboarding?source=dsh-plugin&flowId=...` 唤起桌面端；macOS 走系统协议处理器，Windows、Linux 和开发态用记录中的可执行文件与启动参数传参。URL 由 Host 拼装，不接受客户端传入的路径、命令或回跳地址，也不携带任何凭据。桌面端每次收到该入口都进入自己的引导页，与是否已完成过引导无关。
 
-检测到 Desktop 正在运行时，插件跳过 Connector 自动恢复和账号资料刷新，账号、设备与 Connector 交由桌面端管理；插件只保留 DSH runtime 端点（`~/.agents-anywhere/dsh-bridge/endpoint.json`，位于操作系统用户主目录，不随 `DSH_HOME` 变化）和桥接日志。Desktop 退出后，插件可以恢复先前已授权的连接。
+检测到 Desktop 正在运行时，插件跳过 Connector 自动恢复和账号资料刷新，账号、设备与 Connector 交由桌面端管理；插件只保留桥接（连接 Connector 发布的 `~/.agents-anywhere/dsh-bridge/connector.json`，位于操作系统用户主目录，不随 `DSH_HOME` 变化）和桥接日志。Desktop 退出后，插件可以恢复先前已授权的连接。
 
 ## 原生命令桥接
 

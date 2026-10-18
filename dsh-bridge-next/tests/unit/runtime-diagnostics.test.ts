@@ -58,13 +58,13 @@ test('log summaries expose the RPC method and distinguish rejection from complet
   const root = await mkdtemp(join(tmpdir(), 'aa-log-summary-'))
   try {
     const log = new RuntimeDiagnostics(undefined, root)
-    log.log('debug', 'rpc.completed', { method: 'session.getState' })
+    log.log('debug', 'rpc.completed', { method: 'getSessionState' })
     log.log('warn', 'rpc.rejected', { method: 'session.send' })
     log.log('debug', 'session.read.started')
     await log.flush()
     const first = await readBridgeLogs(root)
     assert.deepEqual(first.entries.map(entry => [entry.method, entry.outcome]), [
-      ['session.getState', 'success'], ['session.send', 'failure'], ['session.read', 'pending'],
+      ['getSessionState', 'success'], ['session.send', 'failure'], ['session.read', 'pending'],
     ])
     log.log('info', 'bridge.listening')
     await log.flush()

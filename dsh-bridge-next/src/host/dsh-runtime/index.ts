@@ -6,7 +6,7 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-session-query'
 import { join } from 'node:path'
 import { bridgeDirectory, Config, legacyBridgeDirectory, stateRoot } from '../config.js'
-import { RuntimeServer } from './server.js'
+import { BridgeConnection } from './connection.js'
 import { NativeRuntime } from './native.js'
 import { RuntimeDiagnostics } from './diagnostics.js'
 
@@ -18,8 +18,8 @@ declare module '@deepseek-ai/cordis' {
 export class DshRuntimeService extends Service {
   static inject = ['sessions', 'sessionQuery', 'workspaceRegistry']
   static Config = Config
-  private server: RuntimeServer
-  private readonly makeServer: () => RuntimeServer
+  private server: BridgeConnection
+  private readonly makeServer: () => BridgeConnection
   private restartTask: Promise<BridgeStatus> | undefined
   private disposed = false
   private currentStatus: BridgeStatus = { state: 'starting', message: '正在启动本机连接…', hint: '', canRetry: false }
@@ -34,7 +34,8 @@ export class DshRuntimeService extends Service {
     this.diagnostics = new RuntimeDiagnostics(ctx.logger('agents-anywhere-runtime'), join(stateRoot(config), 'logs'))
     this.native = new NativeRuntime(ctx, join(bridge, 'create-intents'), this.diagnostics,
       legacy && join(legacy, 'attachments', 'staging'))
-    this.makeServer = () => new RuntimeServer(join(bridge, 'endpoint.json'), {
+    // The Connector publishes its Router in connector.json; the plugin registers the Bridge on it.
+    this.makeServer = () => new BridgeConnection(join(bridge, 'connector.json'), {
       native: this.native,
       query: { listSessions: signal => this.native.inventory(signal), readSession: id => this.native.read(id),
         readTitleSnapshots: async (ids, signal) => {
@@ -51,7 +52,7 @@ export class DshRuntimeService extends Service {
           return results
         } },
       status: id => this.native.status(id),
-    }, this.diagnostics, undefined, legacy && join(legacy, 'endpoint.json'))
+    }, this.diagnostics)
     this.server = this.makeServer()
     ctx.effect(() => async () => {
       this.disposed = true

@@ -1,6 +1,6 @@
 import { jsonBytes } from './json-size.js'
-import { randomUUID } from 'node:crypto'
 import { receiptKey } from './attachments.js'
+import type { SnapshotPage, SnapshotRequest, SnapshotResult, SyncBatch as WireBatch } from '../generated/dsh-sync.js'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionLogSnapshot } from '@deepseek-ai/dsh-session-query'
@@ -8,12 +8,18 @@ import { createProjection, replayHistory, PROJECTION_VERSION, type SessionProjec
 import { sessionId } from './identity.js'
 import type { NativeChange, NativeRuntime } from './native.js'
 import { record, type TimelineItem } from './types.js'
-import { BridgeError } from './errors.js'
 import type { SourceState } from './sessions/source.js'
 
 export type SyncOperation = { kind: string, [key: string]: unknown }
-export interface SyncBatch { streamId: string, batchSeq: number, projectionVersion: number, operations: SyncOperation[] }
 export interface SyncCheckpoint { version: 1, projectionVersion: typeof PROJECTION_VERSION, throughSeq: number, historyHash: string, settled: boolean }
+/** What the feed needs from the Connector; one call per batch, checkpoint or capture. */
+export interface SyncTransport {
+  ingestBatch(batch: WireBatch, signal: AbortSignal): Promise<void>
+  loadCheckpoint(externalSessionId: string): Promise<Record<string, unknown> | null>
+  saveCheckpoint(externalSessionId: string, checkpoint: SyncCheckpoint): Promise<void>
+  deleteCheckpoint(externalSessionId: string): Promise<void>
+  ingestSnapshot(request: SnapshotRequest, pages: AsyncIterable<SnapshotPage>): Promise<SnapshotResult>
+}
 
 function matchesCheckpoint(value: unknown, projection: SessionProjection): boolean {
   const checkpoint = record(value)
@@ -26,9 +32,8 @@ export const SYNC_FLUSH_MS = Math.ceil(1000 / 30)
 
 class SyncTransportError extends Error {}
 
-/** One ordered stream. Checkpoint-aware peers ingest history before ACK/save; page ACKs only confirm receipt. */
+/** One ordered subscription. A batch's delivery call returns only after the Connector ingested it. */
 export class SyncFeed {
-  readonly id = randomUUID()
   private batchSeq = 0
   private queue: NativeChange[] = []
   private queuedInvalidations = new Set<string>()
@@ -37,8 +42,6 @@ export class SyncFeed {
   private published = new Map<string, string>()
   private sourceAvailability = new Map<string, string>()
   private failedSessions = new Map<string, SourceState>()
-  private capture: { id: string, snapshotId: string } | undefined
-  private waitAck: { seq: number, bytesSent: number, progress: () => void, resolve: () => void, reject: (error: Error) => void } | undefined
   private wake: (() => void) | undefined
   private closed = false
   private unwatch: () => void
@@ -46,12 +49,11 @@ export class SyncFeed {
   private lastSentAt = -Infinity
   private bufferedOperations: SyncOperation[] | undefined
   private bufferedBytes = 0
-  private receivedCheckpoint: unknown
   private checkpointDirty = new Set<string>()
 
-  constructor(private native: NativeRuntime, private namespace: string,
-    private notify: (batch: SyncBatch) => void, private failed: (error: unknown) => void,
-    private ackTimeoutMs = 60_000, private durableCheckpoints = false, private uploadProgress = false) {
+  constructor(private native: NativeRuntime, private namespace: string, readonly id: string,
+    private transport: SyncTransport, private failed: (error: unknown) => void,
+    private durableCheckpoints = false) {
     this.unwatch = native.watch(change => {
       if (this.closed) return
       // These events invalidate current facts; replaying every invalidation
@@ -77,35 +79,15 @@ export class SyncFeed {
     void this.run().catch(error => { if (!this.closed) this.fail(error) })
   }
   private fail(error: unknown): void {
-    this.native.diagnostics.log('error', 'sync.failed', { streamId: this.id, batchSeq: this.batchSeq, waitingAck: this.waitAck?.seq, queuedEvents: this.queue.length }, error)
+    this.native.diagnostics.log('error', 'sync.failed', { streamId: this.id, batchSeq: this.batchSeq, queuedEvents: this.queue.length }, error)
     this.close(); this.failed(error)
-  }
-  ack(seq: number, checkpoint?: unknown): void {
-    if (seq < 1 || seq > this.batchSeq || !Number.isSafeInteger(seq)) throw new BridgeError('INVALID_PARAMS', 'Invalid event acknowledgement.')
-    if (this.waitAck?.seq === seq) {
-      this.receivedCheckpoint = checkpoint
-      this.native.diagnostics.log('debug', 'sync.ack', { streamId: this.id, batchSeq: seq, elapsedMs: Math.round(performance.now() - this.lastSentAt) })
-      const pending = this.waitAck; this.waitAck = undefined; pending.resolve()
-    }
-  }
-  progress(seq: number, bytesSent: number): void {
-    const pending = this.waitAck
-    if (!this.uploadProgress || !pending || pending.seq !== seq || !Number.isSafeInteger(seq)
-      || !Number.isSafeInteger(bytesSent) || bytesSent < 1) {
-      throw new BridgeError('INVALID_PARAMS', 'Invalid upload progress.')
-    }
-    if (bytesSent <= pending.bytesSent) return
-    pending.bytesSent = bytesSent
-    pending.progress()
   }
   close(): void {
     if (this.closed) return
-    this.native.diagnostics.log('info', 'sync.stopped', { streamId: this.id, batchSeq: this.batchSeq, waitingAck: this.waitAck?.seq })
+    this.native.diagnostics.log('info', 'sync.stopped', { streamId: this.id, batchSeq: this.batchSeq })
     this.closed = true
     this.abort.abort()
     this.unwatch()
-    this.waitAck?.reject(new Error('DSH sync closed'))
-    this.waitAck = undefined
     this.wake?.(); this.wake = undefined
     this.queue = []; this.queuedBytes = 0; this.projections.clear()
     this.queuedInvalidations.clear()
@@ -140,37 +122,25 @@ export class SyncFeed {
       await delay(Math.ceil(SYNC_FLUSH_MS - (performance.now() - this.lastSentAt)), undefined, { signal: this.abort.signal })
     }
     this.abort.signal.throwIfAborted()
-    const batch: SyncBatch = { streamId: this.id, batchSeq: ++this.batchSeq, projectionVersion: PROJECTION_VERSION, operations }
-    if (jsonBytes(batch) > 7 * 1024 * 1024) throw new Error('DSH sync batch exceeds frame size')
-    await new Promise<void>((resolve, reject) => {
-      const expire = () => {
-        this.waitAck = undefined
-        reject(new SyncTransportError('DSH event acknowledgement timed out'))
-      }
-      let timer = setTimeout(expire, this.ackTimeoutMs)
-      timer.unref()
-      this.waitAck = { seq: batch.batchSeq, bytesSent: 0,
-        progress: () => { clearTimeout(timer); timer = setTimeout(expire, this.ackTimeoutMs); timer.unref() },
-        resolve: () => { clearTimeout(timer); resolve() },
-        reject: error => { clearTimeout(timer); reject(error) } }
-      this.lastSentAt = performance.now()
-      try {
-        this.native.diagnostics.log('debug', 'sync.batch', { streamId: this.id, batchSeq: batch.batchSeq, operations: operations.length, kinds: operations.map(op => op.kind).join(',') })
-        this.notify(batch)
-      } catch (error) {
-        clearTimeout(timer); this.waitAck = undefined
-        reject(new SyncTransportError('DSH event delivery failed', { cause: error }))
-      }
-    })
+    const batch: WireBatch = { subscriptionId: this.id, batchSeq: ++this.batchSeq, projectionVersion: PROJECTION_VERSION, operations }
+    if (jsonBytes(batch) > MAX_BYTES) throw new Error('DSH sync batch exceeds the transport limit')
+    this.lastSentAt = performance.now()
+    this.native.diagnostics.log('debug', 'sync.batch', { streamId: this.id, batchSeq: batch.batchSeq, operations: operations.length, kinds: operations.map(op => op.kind).join(',') })
+    try {
+      // No deadline: a slow upload is a slow answer, and MeshCall keepalives watch the connection.
+      await this.transport.ingestBatch(batch, this.abort.signal)
+    } catch (error) {
+      throw new SyncTransportError('DSH event delivery failed', { cause: error })
+    }
+    this.native.diagnostics.log('debug', 'sync.ack', { streamId: this.id, batchSeq: batch.batchSeq, elapsedMs: Math.round(performance.now() - this.lastSentAt) })
   }
   private async notification(method: string, params: Record<string, unknown>): Promise<void> {
     await this.send([{ kind: 'notifications', notifications: [{ method, params }] }])
   }
-  private async items(kind: string, id: string, items: TimelineItem[], snapshotId?: string): Promise<void> {
+  private async items(id: string, items: TimelineItem[]): Promise<void> {
     let page: TimelineItem[] = [], bytes = 0
     const sendPage = async () => {
-      if (snapshotId) await this.send([{ kind, sessionId: sessionId(this.namespace, id), items: page, snapshotId }])
-      else await this.send([{ kind: 'notifications', notifications: page.map(item => ({
+      await this.send([{ kind: 'notifications', notifications: page.map(item => ({
         method: 'timeline.itemUpsert', params: { sessionId: item.sessionId, externalSessionId: id, item },
       })) }])
     }
@@ -185,6 +155,19 @@ export class SyncFeed {
       page.push(item); bytes += size
     }
     if (page.length && await this.native.visible(id)) await sendPage()
+  }
+  /** Snapshot pages for one capture, bounded like the old snapshot.items frames. */
+  private async *pages(items: TimelineItem[]): AsyncIterable<SnapshotPage> {
+    let page: TimelineItem[] = [], bytes = 0
+    for (const item of items) {
+      const size = jsonBytes(item)
+      if (size > MAX_BYTES) throw new Error('A DSH Timeline item exceeds the transport limit')
+      if (page.length && (bytes + size > MAX_BYTES || page.length >= 250)) {
+        yield { items: page as unknown as Record<string, unknown>[] }; page = []; bytes = 0
+      }
+      page.push(item); bytes += size
+    }
+    if (page.length) yield { items: page as unknown as Record<string, unknown>[] }
   }
   private async baseline(id: string, restore = false): Promise<void> {
     await this.sessionOperation(id, 'snapshot', () => this.publishBaseline(id, restore))
@@ -205,8 +188,7 @@ export class SyncFeed {
     const projection = createProjection(id, platformId, this.durableCheckpoints)
     let resumed = false
     if (restore && this.durableCheckpoints) {
-      await this.send([{ kind: 'checkpoint.load', externalSessionId: id }])
-      const checkpoint = record(this.receivedCheckpoint)
+      const checkpoint = record(await this.delivery(() => this.transport.loadCheckpoint(id)) ?? {})
       if (Number.isSafeInteger(checkpoint.throughSeq) && Number(checkpoint.throughSeq) >= -1) {
         await replayHistory(projection, log, this.abort.signal, Number(checkpoint.throughSeq))
         resumed = matchesCheckpoint(checkpoint, projection)
@@ -225,7 +207,7 @@ export class SyncFeed {
         this.published.set(id, platformId)
         this.sourceAvailability.set(id, 'available')
         await this.notification('session.meta.upsert', { sessionId: platformId, ...meta })
-        await this.items('timeline.upsert', id, delta.items)
+        await this.items(id, delta.items)
         this.checkpointDirty.add(id)
         await this.notices(id)
         await this.state(id, log)
@@ -233,21 +215,17 @@ export class SyncFeed {
         return
       }
     }
-    const snapshotId = randomUUID()
     if (!await this.native.visible(id)) return
     this.native.diagnostics.log('debug', 'snapshot.started', { streamId: this.id, sessionId: id })
-    this.capture = { id, snapshotId }
-    await this.send([{ kind: 'snapshot.begin', sessionId: platformId, snapshotId,
-      meta,
-      throughSeq: projection.throughSeq }])
     const snapshotItems = contentItems(projection.snapshot())
-    await this.items('snapshot.items', id, snapshotItems, snapshotId)
-    if (!await this.native.visible(id)) {
-      await this.send([{ kind: 'snapshot.abort', sessionId: platformId, snapshotId }]); this.capture = undefined; return
+    const result = await this.delivery(() => this.transport.ingestSnapshot({ subscriptionId: this.id, sessionId: platformId,
+      meta, throughSeq: projection.throughSeq }, this.pages(snapshotItems)))
+    if (!result.accepted) {
+      // Permanently refused: the Connector already published the session as unavailable.
+      this.failedSessions.set(id, { availability: 'unavailable', reason: (result.reason ?? 'sync_failed') as string, observedAt: new Date().toISOString() })
+      this.native.diagnostics.log('warn', 'snapshot.quarantined', { streamId: this.id, sessionId: id, reason: result.reason ?? undefined })
+      return
     }
-    await this.send([{ kind: 'snapshot.commit', sessionId: platformId, snapshotId,
-      totalItems: snapshotItems.length, throughSeq: projection.throughSeq }])
-    this.capture = undefined
     this.failedSessions.delete(id)
     projection.drain()
     this.projections.set(id, projection)
@@ -299,12 +277,24 @@ export class SyncFeed {
         ...source, observationOrigin: 'event' })
       this.sourceAvailability.set(id, source.availability)
     }
-    if (this.durableCheckpoints) await this.send([{ kind: 'checkpoint.delete', externalSessionId: id }])
+    if (this.durableCheckpoints) await this.delivery(() => this.transport.deleteCheckpoint(id))
     this.published.delete(id); this.projections.delete(id)
   }
   private async sourceState(id: string): Promise<SourceState> {
     const source = await this.native.source.state(id)
     return source.availability === 'available' ? this.failedSessions.get(id) ?? source : source
+  }
+  /**
+   * A delivery failure (network, Server 5xx, deadline) fails the whole feed so
+   * the Connector resubscribes and recalibrates. Only durable refusals are
+   * reported through the call's own result and isolated per session.
+   */
+  private async delivery<T>(operation: () => Promise<T>): Promise<T> {
+    try { return await operation() }
+    catch (error) {
+      if (this.closed || error instanceof SyncTransportError || error instanceof Error && error.name === 'AbortError') throw error
+      throw new SyncTransportError('DSH event delivery failed', { cause: error })
+    }
   }
   private async sessionOperation(id: string, phase: string, operation: () => Promise<void>): Promise<void> {
     try { await operation() }
@@ -312,10 +302,6 @@ export class SyncFeed {
       if (this.closed || error instanceof SyncTransportError || error instanceof Error && error.name === 'AbortError') throw error
       this.native.diagnostics.log('error', 'sync.session_failed', { streamId: this.id, sessionId: id, phase }, error)
       this.failedSessions.set(id, { availability: 'unavailable', reason: 'sync_failed', observedAt: new Date().toISOString() })
-      if (this.capture?.id === id) {
-        await this.send([{ kind: 'snapshot.abort', sessionId: sessionId(this.namespace, id), snapshotId: this.capture.snapshotId }])
-        this.capture = undefined
-      }
       await this.unavailable(id)
     }
   }
@@ -393,7 +379,7 @@ export class SyncFeed {
       // Existing ingest has no item-delete notification. Reconcile that session
       // with its complete snapshot when native finalization discards a draft.
       if (delta.removed.length) await this.baseline(id)
-      else await this.items('timeline.upsert', id, delta.items)
+      else await this.items(id, delta.items)
     })
     for (const [id, params] of ended) await this.sessionOperation(id, 'turnEnded', async () => {
       if (this.published.has(id) && await this.native.visible(id)) await this.notification('session.turnEnded', params)
@@ -447,7 +433,7 @@ export class SyncFeed {
       if (!projection || !this.published.has(id) || this.failedSessions.has(id)) continue
       const checkpoint: SyncCheckpoint = { version: 1, projectionVersion: PROJECTION_VERSION,
         throughSeq: projection.throughSeq, historyHash: projection.historyHash!, settled: projection.settled }
-      await this.send([{ kind: 'checkpoint.save', externalSessionId: id, checkpoint }])
+      await this.transport.saveCheckpoint(id, checkpoint)
     }
     this.checkpointDirty.clear()
   }
