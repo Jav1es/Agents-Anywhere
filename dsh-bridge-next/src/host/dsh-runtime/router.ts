@@ -260,9 +260,12 @@ export class RuntimeRouter {
     }
     const titles = await this.reader.query.readTitleSnapshots(records.map(item => item.header.id), signal)
     const titleById = new Map(titles.map(title => [title.sessionId, title]))
-    // Sort by last activity, matching the DSH sidebar (which orders by
-    // `max(updatedAt, lastPromptAt)`) instead of by creation time. Resolved in
-    // parallel so a full page costs one round of reads, not a serial chain.
+    // Order by last activity, matching the DSH sidebar (which sorts by
+    // `max(updatedAt, lastPromptAt)`), instead of by creation time. The timestamp
+    // comes from the log `readTitleSnapshots` already read for these same ids, so
+    // this costs no extra read; a failed read leaves the id out and that session
+    // keeps its previous `header.createdAt` position. Resolved in parallel so the
+    // contract stays correct even for a reader that does have to read.
     const lastActivityById = new Map<string, number>()
     if (this.reader.lastActivityAt !== undefined) {
       const readings = await Promise.all(records.map(async item => {

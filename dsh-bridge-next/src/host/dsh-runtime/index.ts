@@ -27,6 +27,17 @@ export class DshRuntimeService extends Service {
   private restartTask: Promise<BridgeStatus> | undefined
   private disposed = false
   private currentStatus: BridgeStatus = { state: 'starting', message: '正在启动本机连接…', hint: '', canRetry: false }
+  /**
+   * Last activity per session, refreshed every time that session's log is read.
+   *
+   * Keyed by log identity rather than by page: `readTitleSnapshots` fills it from
+   * the log it reads anyway and `lastActivityAt` only reads it back, so ordering a
+   * page costs no read of its own. Never cleared, because two concurrent `list`
+   * calls would otherwise evict each other's entries and silently fall back to
+   * `header.createdAt`; one number per session is negligible next to the retained
+   * log snapshots in `SessionSource`.
+   */
+  private readonly lastActivity = new Map<string, number>()
   status(): BridgeStatus { return { ...this.currentStatus } }
   private readonly diagnostics: RuntimeDiagnostics
   private readonly logOutput = new RpcLogOutput()
@@ -50,18 +61,20 @@ export class DshRuntimeService extends Service {
             try {
               const log = await this.native.source.readLog(id)
               const title = foldSessionTitle(log.events)
+              // Same timestamp `sync.ts` reports as `lastActivityAt`, taken from the
+              // log this loop already read, so ordering costs no second read.
+              this.lastActivity.set(id, log.events.at(-1)?.time ?? log.session.createdAt)
               results.push({ sessionId: id, status: 'fulfilled', value: { session: log.session, ...(title ? { title } : {}) } })
             } catch (reason) { results.push({ sessionId: id, status: 'rejected', reason }) }
           }
           signal?.throwIfAborted()
           return results
-        },
-        // Mirrors the timestamp `sync.ts` already reports as `lastActivityAt`, so
-        // the list orders by last activity the same way the session.meta upserts do.
-        lastActivityAt: async (id: SessionId) => {
-          const log = await this.native.source.readLog(id)
-          return log.events.at(-1)?.time ?? log.session.createdAt
         } },
+      // Sibling of `query`, not a member of it: `SessionReader.lastActivityAt` is
+      // its own field. Served from the log `readTitleSnapshots` just read — `list`
+      // asks for the same ids it is about to order, so no entry means that
+      // session's log read failed and the caller falls back to `header.createdAt`.
+      lastActivityAt: async (id: SessionId) => this.lastActivity.get(id),
       status: id => this.native.status(id),
     }, this.diagnostics, 1000, this.logOutput)
     this.server = this.makeServer()
