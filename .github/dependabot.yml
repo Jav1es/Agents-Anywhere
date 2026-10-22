@@ -1,0 +1,53 @@
+# Dependabot 配置 —— 本仓库是 fork，策略与自有项目不同。
+#
+# 背景（2026-10-22）：
+#   本 fork 相对上游 ahead=0 / behind=40，没有任何自有改动。
+#   自动开的依赖版本 PR 全部落在 _reference/ 与 _deprecated/ 目录
+#   （上游的参考实现与已废弃代码），合并只会让 fork 偏离上游，
+#   下次同步时制造冲突。
+#
+# 策略：
+#   1. 关闭所有版本更新（open-pull-requests-limit: 0）
+#      —— 这是 GitHub 官方支持的「只保留安全更新」写法。
+#   2. 安全更新不受此限制：Dependabot security updates 由仓库设置控制，
+#      仍会在发现漏洞时开 PR。安全告警（alerts）也继续监控。
+#
+# 如果将来本 fork 开始承载自有代码，把对应目录的 limit 调回默认值即可。
+
+version: 2
+updates:
+  # web-next：上游的 Next.js 前端（含 _reference 与 _deprecated 子目录）
+  - package-ecosystem: "npm"
+    directory: "/web-next"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "chore(deps)"
+
+  # 根目录（如有）
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "chore(deps)"
+
+  # _deprecated/dsh-bridge-before-gateway：已废弃的旧桥接实现
+  - package-ecosystem: "npm"
+    directory: "/_deprecated/dsh-bridge-before-gateway"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "chore(deps)"
+
+  # Python 依赖（如有）
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "chore(deps)"
